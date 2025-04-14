@@ -1,0 +1,11 @@
+AlphaFold_with_4G8A_single.json
+/output/
+/foldx_result/
+/input_json/
+/aziu2_aziu3_pred/
+*.out
+/my_script/
+/src/
+*.log
+*.json
+*.png
