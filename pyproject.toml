@@ -29,6 +29,9 @@ dependencies = [
     "tqdm",
     "typeguard==2.13.3",
     "zstandard",
+    "setuptools>=75.6.0",
+    "biopython>=1.85",
+    "pandas>=2.2.3",
 ]
 
 [project.optional-dependencies]

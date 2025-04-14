@@ -485,9 +485,11 @@ def process_fold_input(
 def replace_db_dir(path_with_db_dir: str, db_dirs: Sequence[str]) -> str:
   """Replaces the DB_DIR placeholder in a path with the given DB_DIR."""
   template = string.Template(path_with_db_dir)
+  print(f"{template=}, {DB_DIR=}")
   if 'DB_DIR' in template.get_identifiers():
     for db_dir in db_dirs:
       path = template.substitute(DB_DIR=db_dir)
+      print(f"{path=}")
       if os.path.exists(path):
         return path
     raise FileNotFoundError(
