@@ -19,9 +19,10 @@ if received directly from Google. Use is subject to terms of use available at
 https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md
 """
 
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Sequence
 import csv
 import dataclasses
+import datetime
 import functools
 import multiprocessing
 import os
@@ -31,11 +32,10 @@ import string
 import textwrap
 import time
 import typing
-from typing import Protocol, Self, TypeVar, overload
+from typing import overload
 
 from absl import app
 from absl import flags
-from alphafold3.common import base_config
 from alphafold3.common import folding_input
 from alphafold3.common import resources
 from alphafold3.constants import chemical_components
@@ -44,11 +44,10 @@ from alphafold3.data import featurisation
 from alphafold3.data import pipeline
 from alphafold3.jax.attention import attention
 from alphafold3.model import features
+from alphafold3.model import model
 from alphafold3.model import params
 from alphafold3.model import post_processing
-from alphafold3.model.components import base_model
 from alphafold3.model.components import utils
-from alphafold3.model.diffusion import model as diffusion_model
 import haiku as hk
 import jax
 from jax import numpy as jnp
@@ -76,25 +75,10 @@ _OUTPUT_DIR = flags.DEFINE_string(
     None,
     'Path to a directory where the results will be saved.',
 )
-
 MODEL_DIR = flags.DEFINE_string(
     'model_dir',
     _DEFAULT_MODEL_DIR.as_posix(),
     'Path to the model to use for inference.',
-)
-
-_FLASH_ATTENTION_IMPLEMENTATION = flags.DEFINE_enum(
-    'flash_attention_implementation',
-    default='triton',
-    enum_values=['triton', 'cudnn', 'xla'],
-    help=(
-        "Flash attention implementation to use. 'triton' and 'cudnn' uses a"
-        ' Triton and cuDNN flash attention implementation, respectively. The'
-        ' Triton kernel is fastest and has been tested more thoroughly. The'
-        " Triton and cuDNN kernels require Ampere GPUs or later. 'xla' uses an"
-        ' XLA attention implementation (no flash attention) and is portable'
-        ' across GPU devices.'
-    ),
 )
 
 # Control which stages to run.
@@ -205,14 +189,38 @@ _NHMMER_N_CPU = flags.DEFINE_integer(
     ' beyond 8 CPUs provides very little additional speedup.',
 )
 
-# Compilation cache.
+# Template search configuration.
+_MAX_TEMPLATE_DATE = flags.DEFINE_string(
+    'max_template_date',
+    '2021-09-30',  # By default, use the date from the AlphaFold 3 paper.
+    'Maximum template release date to consider. Format: YYYY-MM-DD. All'
+    ' templates released after this date will be ignored. Controls also whether'
+    ' to allow use of model coordinates for a chemical component from the CCD'
+    ' if RDKit conformer generation fails and the component does not have ideal'
+    ' coordinates set. Only for components that have been released before this'
+    ' date the model coordinates can be used as a fallback.',
+)
+
+_CONFORMER_MAX_ITERATIONS = flags.DEFINE_integer(
+    'conformer_max_iterations',
+    None,  # Default to RDKit default parameters value.
+    'Optional override for maximum number of iterations to run for RDKit '
+    'conformer search.',
+)
+
+# JAX inference performance tuning.
 _JAX_COMPILATION_CACHE_DIR = flags.DEFINE_string(
     'jax_compilation_cache_dir',
     None,
     'Path to a directory for the JAX compilation cache.',
 )
-
-# Compilation buckets.
+_GPU_DEVICE = flags.DEFINE_integer(
+    'gpu_device',
+    0,
+    'Optional override for the GPU device to use for inference. Defaults to the'
+    ' 1st GPU on the system. Useful on multi-GPU systems to pin each run to a'
+    ' specific GPU.',
+)
 _BUCKETS = flags.DEFINE_list(
     'buckets',
     # pyformat: disable
@@ -223,40 +231,73 @@ _BUCKETS = flags.DEFINE_list(
     ' For any input with more tokens than the largest bucket size, a new bucket'
     ' is created for exactly that number of tokens.',
 )
+_FLASH_ATTENTION_IMPLEMENTATION = flags.DEFINE_enum(
+    'flash_attention_implementation',
+    default='triton',
+    enum_values=['triton', 'cudnn', 'xla'],
+    help=(
+        "Flash attention implementation to use. 'triton' and 'cudnn' uses a"
+        ' Triton and cuDNN flash attention implementation, respectively. The'
+        ' Triton kernel is fastest and has been tested more thoroughly. The'
+        " Triton and cuDNN kernels require Ampere GPUs or later. 'xla' uses an"
+        ' XLA attention implementation (no flash attention) and is portable'
+        ' across GPU devices.'
+    ),
+)
+_NUM_RECYCLES = flags.DEFINE_integer(
+    'num_recycles',
+    10,
+    'Number of recycles to use during inference.',
+    lower_bound=1,
+)
+_NUM_DIFFUSION_SAMPLES = flags.DEFINE_integer(
+    'num_diffusion_samples',
+    5,
+    'Number of diffusion samples to generate.',
+    lower_bound=1,
+)
+_NUM_SEEDS = flags.DEFINE_integer(
+    'num_seeds',
+    None,
+    'Number of seeds to use for inference. If set, only a single seed must be'
+    ' provided in the input JSON. AlphaFold 3 will then generate random seeds'
+    ' in sequence, starting from the single seed specified in the input JSON.'
+    ' The full input JSON produced by AlphaFold 3 will include the generated'
+    ' random seeds. If not set, AlphaFold 3 will use the seeds as provided in'
+    ' the input JSON.',
+    lower_bound=1,
+)
 
-
-class ConfigurableModel(Protocol):
-  """A model with a nested config class."""
-
-  class Config(base_config.BaseConfig):
-    ...
-
-  def __call__(self, config: Config) -> Self:
-    ...
-
-  @classmethod
-  def get_inference_result(
-      cls: Self,
-      batch: features.BatchDict,
-      result: base_model.ModelResult,
-      target_name: str = '',
-  ) -> Iterable[base_model.InferenceResult]:
-    ...
-
-
-ModelT = TypeVar('ModelT', bound=ConfigurableModel)
+# Output controls.
+_SAVE_EMBEDDINGS = flags.DEFINE_bool(
+    'save_embeddings',
+    False,
+    'Whether to save the final trunk single and pair embeddings in the output.',
+)
+_FORCE_OUTPUT_DIR = flags.DEFINE_bool(
+    'force_output_dir',
+    False,
+    'Whether to force the output directory to be used even if it already exists'
+    ' and is non-empty. Useful to set this to True to run the data pipeline and'
+    ' the inference separately, but use the same output directory.',
+)
 
 
 def make_model_config(
     *,
-    model_class: type[ModelT] = diffusion_model.Diffuser,
     flash_attention_implementation: attention.Implementation = 'triton',
-):
-  config = model_class.Config()
-  if hasattr(config, 'global_config'):
-    config.global_config.flash_attention_implementation = (
-        flash_attention_implementation
-    )
+    num_diffusion_samples: int = 5,
+    num_recycles: int = 10,
+    return_embeddings: bool = False,
+) -> model.Model.Config:
+  """Returns a model config with some defaults overridden."""
+  config = model.Model.Config()
+  config.global_config.flash_attention_implementation = (
+      flash_attention_implementation
+  )
+  config.heads.diffusion.eval.num_samples = num_diffusion_samples
+  config.num_recycles = num_recycles
+  config.return_embeddings = return_embeddings
   return config
 
 
@@ -265,12 +306,10 @@ class ModelRunner:
 
   def __init__(
       self,
-      model_class: ConfigurableModel,
-      config: base_config.BaseConfig,
+      config: model.Model.Config,
       device: jax.Device,
       model_dir: pathlib.Path,
   ):
-    self._model_class = model_class
     self._model_config = config
     self._device = device
     self._model_dir = model_dir
@@ -283,15 +322,12 @@ class ModelRunner:
   @functools.cached_property
   def _model(
       self,
-  ) -> Callable[[jnp.ndarray, features.BatchDict], base_model.ModelResult]:
+  ) -> Callable[[jnp.ndarray, features.BatchDict], model.ModelResult]:
     """Loads model parameters and returns a jitted model forward pass."""
-    assert isinstance(self._model_config, self._model_class.Config)
 
     @hk.transform
     def forward_fn(batch):
-      result = self._model_class(self._model_config)(batch)
-      result['__identifier__'] = self.model_params['__meta__']['__identifier__']
-      return result
+      return model.Model(self._model_config)(batch)
 
     return functools.partial(
         jax.jit(forward_fn.apply, device=self._device), self.model_params
@@ -299,7 +335,7 @@ class ModelRunner:
 
   def run_inference(
       self, featurised_example: features.BatchDict, rng_key: jnp.ndarray
-  ) -> base_model.ModelResult:
+  ) -> model.ModelResult:
     """Computes a forward pass of the model on a featurised example."""
     featurised_example = jax.device_put(
         jax.tree_util.tree_map(
@@ -314,21 +350,32 @@ class ModelRunner:
         lambda x: x.astype(jnp.float32) if x.dtype == jnp.bfloat16 else x,
         result,
     )
-    result['__identifier__'] = result['__identifier__'].tobytes()
+    result = dict(result)
+    identifier = self.model_params['__meta__']['__identifier__'].tobytes()
+    result['__identifier__'] = identifier
     return result
 
-  def extract_structures(
+  def extract_inference_results_and_maybe_embeddings(
       self,
       batch: features.BatchDict,
-      result: base_model.ModelResult,
+      result: model.ModelResult,
       target_name: str,
-  ) -> list[base_model.InferenceResult]:
-    """Generates structures from model outputs."""
-    return list(
-        self._model_class.get_inference_result(
+  ) -> tuple[list[model.InferenceResult], dict[str, np.ndarray] | None]:
+    """Extracts inference results and embeddings (if set) from model outputs."""
+    inference_results = list(
+        model.Model.get_inference_result(
             batch=batch, result=result, target_name=target_name
         )
     )
+    num_tokens = len(inference_results[0].metadata['token_chain_ids'])
+    embeddings = {}
+    if 'single_embeddings' in result:
+      embeddings['single_embeddings'] = result['single_embeddings'][:num_tokens]
+    if 'pair_embeddings' in result:
+      embeddings['pair_embeddings'] = result['pair_embeddings'][
+          :num_tokens, :num_tokens
+      ]
+    return inference_results, embeddings or None
 
 
 @dataclasses.dataclass(frozen=True, slots=True, kw_only=True)
@@ -340,64 +387,77 @@ class ResultsForSeed:
     inference_results: The inference results, one per sample.
     full_fold_input: The fold input that must also include the results of
       running the data pipeline - MSA and templates.
+    embeddings: The final trunk single and pair embeddings, if requested.
   """
 
   seed: int
-  inference_results: Sequence[base_model.InferenceResult]
+  inference_results: Sequence[model.InferenceResult]
   full_fold_input: folding_input.Input
+  embeddings: dict[str, np.ndarray] | None = None
 
 
 def predict_structure(
     fold_input: folding_input.Input,
     model_runner: ModelRunner,
     buckets: Sequence[int] | None = None,
+    ref_max_modified_date: datetime.date | None = None,
+    conformer_max_iterations: int | None = None,
 ) -> Sequence[ResultsForSeed]:
   """Runs the full inference pipeline to predict structures for each seed."""
 
-  print(f'Featurising data for seeds {fold_input.rng_seeds}...')
+  print(f'Featurising data with {len(fold_input.rng_seeds)} seed(s)...')
   featurisation_start_time = time.time()
   ccd = chemical_components.cached_ccd(user_ccd=fold_input.user_ccd)
   featurised_examples = featurisation.featurise_input(
-      fold_input=fold_input, buckets=buckets, ccd=ccd, verbose=True
+      fold_input=fold_input,
+      buckets=buckets,
+      ccd=ccd,
+      verbose=True,
+      ref_max_modified_date=ref_max_modified_date,
+      conformer_max_iterations=conformer_max_iterations,
   )
   print(
-      f'Featurising data for seeds {fold_input.rng_seeds} took '
+      f'Featurising data with {len(fold_input.rng_seeds)} seed(s) took'
       f' {time.time() - featurisation_start_time:.2f} seconds.'
+  )
+  print(
+      'Running model inference and extracting output structure samples with'
+      f' {len(fold_input.rng_seeds)} seed(s)...'
   )
   all_inference_start_time = time.time()
   all_inference_results = []
   for seed, example in zip(fold_input.rng_seeds, featurised_examples):
-    print(f'Running model inference for seed {seed}...')
+    print(f'Running model inference with seed {seed}...')
     inference_start_time = time.time()
     rng_key = jax.random.PRNGKey(seed)
     result = model_runner.run_inference(example, rng_key)
     print(
-        f'Running model inference for seed {seed} took '
+        f'Running model inference with seed {seed} took'
         f' {time.time() - inference_start_time:.2f} seconds.'
     )
-    print(f'Extracting output structures (one per sample) for seed {seed}...')
+    print(f'Extracting inference results with seed {seed}...')
     extract_structures = time.time()
-    inference_results = model_runner.extract_structures(
-        batch=example, result=result, target_name=fold_input.name
+    inference_results, embeddings = (
+        model_runner.extract_inference_results_and_maybe_embeddings(
+            batch=example, result=result, target_name=fold_input.name
+        )
     )
     print(
-        f'Extracting output structures (one per sample) for seed {seed} took '
-        f' {time.time() - extract_structures:.2f} seconds.'
+        f'Extracting {len(inference_results)} inference samples with'
+        f' seed {seed} took {time.time() - extract_structures:.2f} seconds.'
     )
+
     all_inference_results.append(
         ResultsForSeed(
             seed=seed,
             inference_results=inference_results,
             full_fold_input=fold_input,
+            embeddings=embeddings,
         )
     )
-    print(
-        'Running model inference and extracting output structures for seed'
-        f' {seed} took  {time.time() - inference_start_time:.2f} seconds.'
-    )
   print(
-      'Running model inference and extracting output structures for seeds'
-      f' {fold_input.rng_seeds} took '
+      'Running model inference and extracting output structures with'
+      f' {len(fold_input.rng_seeds)} seed(s) took'
       f' {time.time() - all_inference_start_time:.2f} seconds.'
   )
   return all_inference_results
@@ -409,9 +469,9 @@ def write_fold_input_json(
 ) -> None:
   """Writes the input JSON to the output directory."""
   os.makedirs(output_dir, exist_ok=True)
-  with open(
-      os.path.join(output_dir, f'{fold_input.sanitised_name()}_data.json'), 'wt'
-  ) as f:
+  path = os.path.join(output_dir, f'{fold_input.sanitised_name()}_data.json')
+  print(f'Writing model input JSON to {path}')
+  with open(path, 'wt') as f:
     f.write(fold_input.to_json())
 
 
@@ -436,13 +496,24 @@ def write_outputs(
       sample_dir = os.path.join(output_dir, f'seed-{seed}_sample-{sample_idx}')
       os.makedirs(sample_dir, exist_ok=True)
       post_processing.write_output(
-          inference_result=result, output_dir=sample_dir
+          inference_result=result,
+          output_dir=sample_dir,
+          name=f'{job_name}_seed-{seed}_sample-{sample_idx}',
       )
       ranking_score = float(result.metadata['ranking_score'])
       ranking_scores.append((seed, sample_idx, ranking_score))
       if max_ranking_score is None or ranking_score > max_ranking_score:
         max_ranking_score = ranking_score
         max_ranking_result = result
+
+    if embeddings := results_for_seed.embeddings:
+      embeddings_dir = os.path.join(output_dir, f'seed-{seed}_embeddings')
+      os.makedirs(embeddings_dir, exist_ok=True)
+      post_processing.write_embeddings(
+          embeddings=embeddings,
+          output_dir=embeddings_dir,
+          name=f'{job_name}_seed-{seed}',
+      )
 
   if max_ranking_result is not None:  # True iff ranking_scores non-empty.
     post_processing.write_output(
@@ -454,32 +525,12 @@ def write_outputs(
     )
     # Save csv of ranking scores with seeds and sample indices, to allow easier
     # comparison of ranking scores across different runs.
-    with open(os.path.join(output_dir, 'ranking_scores.csv'), 'wt') as f:
+    with open(
+        os.path.join(output_dir, f'{job_name}_ranking_scores.csv'), 'wt'
+    ) as f:
       writer = csv.writer(f)
       writer.writerow(['seed', 'sample', 'ranking_score'])
       writer.writerows(ranking_scores)
-
-
-@overload
-def process_fold_input(
-    fold_input: folding_input.Input,
-    data_pipeline_config: pipeline.DataPipelineConfig | None,
-    model_runner: None,
-    output_dir: os.PathLike[str] | str,
-    buckets: Sequence[int] | None = None,
-) -> folding_input.Input:
-  ...
-
-
-@overload
-def process_fold_input(
-    fold_input: folding_input.Input,
-    data_pipeline_config: pipeline.DataPipelineConfig | None,
-    model_runner: ModelRunner,
-    output_dir: os.PathLike[str] | str,
-    buckets: Sequence[int] | None = None,
-) -> Sequence[ResultsForSeed]:
-  ...
 
 
 def replace_db_dir(path_with_db_dir: str, db_dirs: Sequence[str]) -> str:
@@ -500,12 +551,43 @@ def replace_db_dir(path_with_db_dir: str, db_dirs: Sequence[str]) -> str:
   return path_with_db_dir
 
 
+@overload
+def process_fold_input(
+    fold_input: folding_input.Input,
+    data_pipeline_config: pipeline.DataPipelineConfig | None,
+    model_runner: None,
+    output_dir: os.PathLike[str] | str,
+    buckets: Sequence[int] | None = None,
+    ref_max_modified_date: datetime.date | None = None,
+    conformer_max_iterations: int | None = None,
+    force_output_dir: bool = False,
+) -> folding_input.Input:
+  ...
+
+
+@overload
+def process_fold_input(
+    fold_input: folding_input.Input,
+    data_pipeline_config: pipeline.DataPipelineConfig | None,
+    model_runner: ModelRunner,
+    output_dir: os.PathLike[str] | str,
+    buckets: Sequence[int] | None = None,
+    ref_max_modified_date: datetime.date | None = None,
+    conformer_max_iterations: int | None = None,
+    force_output_dir: bool = False,
+) -> Sequence[ResultsForSeed]:
+  ...
+
+
 def process_fold_input(
     fold_input: folding_input.Input,
     data_pipeline_config: pipeline.DataPipelineConfig | None,
     model_runner: ModelRunner | None,
     output_dir: os.PathLike[str] | str,
     buckets: Sequence[int] | None = None,
+    ref_max_modified_date: datetime.date | None = None,
+    conformer_max_iterations: int | None = None,
+    force_output_dir: bool = False,
 ) -> folding_input.Input | Sequence[ResultsForSeed]:
   """Runs data pipeline and/or inference on a single fold input.
 
@@ -520,6 +602,17 @@ def process_fold_input(
       number of tokens. If not None, must be a sequence of at least one integer,
       in strictly increasing order. Will raise an error if the number of tokens
       is more than the largest bucket size.
+    ref_max_modified_date: Optional maximum date that controls whether to allow
+      use of model coordinates for a chemical component from the CCD if RDKit
+      conformer generation fails and the component does not have ideal
+      coordinates set. Only for components that have been released before this
+      date the model coordinates can be used as a fallback.
+    conformer_max_iterations: Optional override for maximum number of iterations
+      to run for RDKit conformer search.
+    force_output_dir: If True, do not create a new output directory even if the
+      existing one is non-empty. Instead use the existing output directory and
+      potentially overwrite existing files. If False, create a new timestamped
+      output directory instead if the existing one is non-empty.
 
   Returns:
     The processed fold input, or the inference results for each seed.
@@ -527,16 +620,26 @@ def process_fold_input(
   Raises:
     ValueError: If the fold input has no chains.
   """
-  print(f'Processing fold input {fold_input.name}')
+  print(f'\nRunning fold job {fold_input.name}...')
 
   if not fold_input.chains:
     raise ValueError('Fold input has no chains.')
 
-  if model_runner is not None:
-    # If we're running inference, check we can load the model parameters before
-    # (possibly) launching the data pipeline.
-    print('Checking we can load the model parameters...')
-    _ = model_runner.model_params
+  if (
+      not force_output_dir
+      and os.path.exists(output_dir)
+      and os.listdir(output_dir)
+  ):
+    new_output_dir = (
+        f'{output_dir}_{datetime.datetime.now().strftime("%Y%m%d_%H%M%S")}'
+    )
+    print(
+        f'Output will be written in {new_output_dir} since {output_dir} is'
+        ' non-empty.'
+    )
+    output_dir = new_output_dir
+  else:
+    print(f'Output will be written in {output_dir}')
 
   if data_pipeline_config is None:
     print('Skipping data pipeline...')
@@ -544,26 +647,23 @@ def process_fold_input(
     print('Running data pipeline...')
     fold_input = pipeline.DataPipeline(data_pipeline_config).process(fold_input)
 
-  print(f'Output directory: {output_dir}')
-  print(f'Writing model input JSON to {output_dir}')
   write_fold_input_json(fold_input, output_dir)
   if model_runner is None:
-    print('Skipping inference...')
+    print('Skipping model inference...')
     output = fold_input
   else:
     print(
-        f'Predicting 3D structure for {fold_input.name} for seed(s)'
-        f' {fold_input.rng_seeds}...'
+        f'Predicting 3D structure for {fold_input.name} with'
+        f' {len(fold_input.rng_seeds)} seed(s)...'
     )
     all_inference_results = predict_structure(
         fold_input=fold_input,
         model_runner=model_runner,
         buckets=buckets,
+        ref_max_modified_date=ref_max_modified_date,
+        conformer_max_iterations=conformer_max_iterations,
     )
-    print(
-        f'Writing outputs for {fold_input.name} for seed(s)'
-        f' {fold_input.rng_seeds}...'
-    )
+    print(f'Writing outputs with {len(fold_input.rng_seeds)} seed(s)...')
     write_outputs(
         all_inference_results=all_inference_results,
         output_dir=output_dir,
@@ -571,7 +671,7 @@ def process_fold_input(
     )
     output = all_inference_results
 
-  print(f'Done processing fold input {fold_input.name}.')
+  print(f'Fold job {fold_input.name} done, output written to {output_dir}\n')
   return output
 
 
@@ -615,13 +715,30 @@ def main(_):
   if _RUN_INFERENCE.value:
     # Fail early on incompatible devices, but only if we're running inference.
     gpu_devices = jax.local_devices(backend='gpu')
-    if gpu_devices and float(gpu_devices[0].compute_capability) < 8.0:
-      raise ValueError(
-          'There are currently known unresolved numerical issues with using'
-          ' devices with compute capability less than 8.0. See '
-          ' https://github.com/google-deepmind/alphafold3/issues/59 for'
-          ' tracking.'
+    if gpu_devices:
+      compute_capability = float(
+          gpu_devices[_GPU_DEVICE.value].compute_capability
       )
+      if compute_capability < 6.0:
+        raise ValueError(
+            'AlphaFold 3 requires at least GPU compute capability 6.0 (see'
+            ' https://developer.nvidia.com/cuda-gpus).'
+        )
+      elif 7.0 <= compute_capability < 8.0:
+        xla_flags = os.environ.get('XLA_FLAGS')
+        required_flag = '--xla_disable_hlo_passes=custom-kernel-fusion-rewriter'
+        if not xla_flags or required_flag not in xla_flags:
+          raise ValueError(
+              'For devices with GPU compute capability 7.x (see'
+              ' https://developer.nvidia.com/cuda-gpus) the ENV XLA_FLAGS must'
+              f' include "{required_flag}".'
+          )
+        if _FLASH_ATTENTION_IMPLEMENTATION.value != 'xla':
+          raise ValueError(
+              'For devices with GPU compute capability 7.x (see'
+              ' https://developer.nvidia.com/cuda-gpus) the'
+              ' --flash_attention_implementation must be set to "xla".'
+          )
 
   notice = textwrap.wrap(
       'Running AlphaFold 3. Please note that standard AlphaFold 3 model'
@@ -634,8 +751,9 @@ def main(_):
       break_on_hyphens=False,
       width=80,
   )
-  print('\n'.join(notice))
+  print('\n' + '\n'.join(notice) + '\n')
 
+  max_template_date = datetime.date.fromisoformat(_MAX_TEMPLATE_DATE.value)
   if _RUN_DATA_PIPELINE.value:
     expand_path = lambda x: replace_db_dir(x, DB_DIR.value)
     data_pipeline_config = pipeline.DataPipelineConfig(
@@ -657,45 +775,57 @@ def main(_):
         seqres_database_path=expand_path(_SEQRES_DATABASE_PATH.value),
         jackhmmer_n_cpu=_JACKHMMER_N_CPU.value,
         nhmmer_n_cpu=_NHMMER_N_CPU.value,
+        max_template_date=max_template_date,
     )
   else:
-    print('Skipping running the data pipeline.')
     data_pipeline_config = None
 
   if _RUN_INFERENCE.value:
     devices = jax.local_devices(backend='gpu')
-    print(f'Found local devices: {devices}')
+    print(
+        f'Found local devices: {devices}, using device {_GPU_DEVICE.value}:'
+        f' {devices[_GPU_DEVICE.value]}'
+    )
 
     print('Building model from scratch...')
     model_runner = ModelRunner(
-        model_class=diffusion_model.Diffuser,
         config=make_model_config(
             flash_attention_implementation=typing.cast(
                 attention.Implementation, _FLASH_ATTENTION_IMPLEMENTATION.value
-            )
+            ),
+            num_diffusion_samples=_NUM_DIFFUSION_SAMPLES.value,
+            num_recycles=_NUM_RECYCLES.value,
+            return_embeddings=_SAVE_EMBEDDINGS.value,
         ),
-        device=devices[0],
+        device=devices[_GPU_DEVICE.value],
         model_dir=pathlib.Path(MODEL_DIR.value),
     )
+    # Check we can load the model parameters before launching anything.
+    print('Checking that model parameters can be loaded...')
+    _ = model_runner.model_params
   else:
-    print('Skipping running model inference.')
     model_runner = None
 
-  print(f'Processing {len(fold_inputs)} fold inputs.')
+  num_fold_inputs = 0
   for fold_input in fold_inputs:
+    if _NUM_SEEDS.value is not None:
+      print(f'Expanding fold job {fold_input.name} to {_NUM_SEEDS.value} seeds')
+      fold_input = fold_input.with_multiple_seeds(_NUM_SEEDS.value)
     process_fold_input(
         fold_input=fold_input,
         data_pipeline_config=data_pipeline_config,
         model_runner=model_runner,
         output_dir=os.path.join(_OUTPUT_DIR.value, fold_input.sanitised_name()),
         buckets=tuple(int(bucket) for bucket in _BUCKETS.value),
+        ref_max_modified_date=max_template_date,
+        conformer_max_iterations=_CONFORMER_MAX_ITERATIONS.value,
+        force_output_dir=_FORCE_OUTPUT_DIR.value,
     )
+    num_fold_inputs += 1
 
-  print(f'Done processing {len(fold_inputs)} fold inputs.')
+  print(f'Done running {num_fold_inputs} fold jobs.')
 
 
 if __name__ == '__main__':
-  flags.mark_flags_as_required([
-      'output_dir',
-  ])
+  flags.mark_flags_as_required(['output_dir'])
   app.run(main)

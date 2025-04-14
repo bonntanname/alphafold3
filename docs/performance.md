@@ -95,16 +95,41 @@ AlphaFold 3 can run on inputs of size up to 4,352 tokens on a single NVIDIA A100
       )
     ```
 
+The format of entries in `pair_transition_shard_spec` is
+`(num_tokens_upper_bound, shard_size)`. Setting `shard_size=None` means there is
+no upper bound.
+
+For the example above:
+
+*   `(2048, None)`: for sequences up to 2,048 tokens, do not shard
+*   `(3072, 1024)`: for sequences up to 3,072 tokens, shard in chunks of 1,024
+*   `(None, 512)`: for all other sequences, shard in chunks of 512
+
 While numerically accurate, this configuration will have lower throughput
 compared to the set up on the NVIDIA A100 (80 GB), due to less available memory.
 
-#### Devices other than NVIDIA A100 or H100
+#### NVIDIA V100
 
-There are currently known unresolved numerical issues with using devices other
-than NVIDIA A100 and H100. For now, accuracy has only been validated for A100
-and H100 GPU device types. See
-[this Issue](https://github.com/google-deepmind/alphafold3/issues/59) for
-tracking.
+There are known numerical issues with CUDA Capability 7.x devices. To work
+around the issue, set the ENV XLA_FLAGS to include
+`--xla_disable_hlo_passes=custom-kernel-fusion-rewriter`.
+
+With the above flag set, AlphaFold 3 can run on inputs of size up to 1,280
+tokens on a single NVIDIA V100 using [unified memory](#unified-memory).
+
+#### NVIDIA P100
+
+AlphaFold 3 can run on inputs of size up to 1,024 tokens on a single NVIDIA P100
+with no configuration changes needed.
+
+#### Other devices
+
+Large-scale numerical tests have not been performed on any other devices but
+they are believed to be numerically accurate.
+
+There are known numerical issues with CUDA Capability 7.x devices. To work
+around the issue, set the environment variable `XLA_FLAGS` to include
+`--xla_disable_hlo_passes=custom-kernel-fusion-rewriter`.
 
 ## Compilation Buckets
 
@@ -151,6 +176,17 @@ in the provided `Dockerfile`).
 
 ```sh
 ENV XLA_FLAGS="--xla_gpu_enable_triton_gemm=false"
+```
+
+### CUDA Capability 7.x GPUs
+
+For all CUDA Capability 7.x GPUs (e.g. V100) the environment variable
+`XLA_FLAGS` must be changed to include
+`--xla_disable_hlo_passes=custom-kernel-fusion-rewriter`. Disabling the Tritron
+GEMM kernels is not necessary as they are not supported for such GPUs.
+
+```sh
+ENV XLA_FLAGS="--xla_disable_hlo_passes=custom-kernel-fusion-rewriter"
 ```
 
 ### GPU Memory

@@ -32,7 +32,8 @@ ENV PATH="/hmmer/bin:/alphafold3_venv/bin:$PATH"
 RUN pip3 install --upgrade pip
 
 # Install HMMER. Do so before copying the source code, so that docker can cache
-# the image layer containing HMMER.
+# the image layer containing HMMER. Alternatively, you could also install it 
+# using `apt-get install hmmer` instead of bulding it from source.
 RUN mkdir /hmmer_build /hmmer ; \
     wget http://eddylab.org/software/hmmer/hmmer-3.4.tar.gz --directory-prefix /hmmer_build ; \
     (cd /hmmer_build && tar zxf hmmer-3.4.tar.gz && rm hmmer-3.4.tar.gz) ; \
@@ -55,7 +56,10 @@ RUN build_data
 
 # To work around a known XLA issue causing the compilation time to greatly
 # increase, the following environment variable setting XLA flags must be enabled
-# when running AlphaFold 3:
+# when running AlphaFold 3. Note that if using CUDA capability 7 GPUs, it is
+# necessary to set the following XLA_FLAGS value instead:
+# ENV XLA_FLAGS="--xla_disable_hlo_passes=custom-kernel-fusion-rewriter"
+# (no need to disable gemm in that case as it is not supported for such GPU).
 ENV XLA_FLAGS="--xla_gpu_enable_triton_gemm=false"
 # Memory settings used for folding up to 5,120 tokens on A100 80 GB.
 ENV XLA_PYTHON_CLIENT_PREALLOCATE=true

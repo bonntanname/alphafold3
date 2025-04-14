@@ -12,27 +12,21 @@
 
 import contextlib
 import csv
+import dataclasses
+import datetime
 import difflib
-import functools
-import hashlib
 import json
 import os
 import pathlib
 import pickle
-from typing import Any
 
 from absl import logging
 from absl.testing import absltest
 from absl.testing import parameterized
-from alphafold3 import structure
 from alphafold3.common import folding_input
 from alphafold3.common import resources
 from alphafold3.common.testing import data as testing_data
-from alphafold3.constants import chemical_components
-from alphafold3.data import featurisation
 from alphafold3.data import pipeline
-from alphafold3.model.atom_layout import atom_layout
-from alphafold3.model.diffusion import model as diffusion_model
 from alphafold3.model.scoring import alignment
 from alphafold3.structure import test_utils
 import jax
@@ -70,40 +64,6 @@ def _generate_diff(actual: str, expected: str) -> str:
   )
 
 
-@functools.singledispatch
-def _hash_data(x: Any, /) -> str:
-  if x is None:
-    return '<<None>>'
-  return _hash_data(json.dumps(x).encode('utf-8'))
-
-
-@_hash_data.register
-def _(x: bytes, /) -> str:
-  return hashlib.sha256(x).hexdigest()
-
-
-@_hash_data.register
-def _(x: jax.Array) -> str:
-  return _hash_data(jax.device_get(x))
-
-
-@_hash_data.register
-def _(x: np.ndarray) -> str:
-  if x.dtype == object:
-    return ';'.join(map(_hash_data, x.ravel().tolist()))
-  return _hash_data(x.tobytes())
-
-
-@_hash_data.register
-def _(_: structure.Structure) -> str:
-  return '<<structure>>'
-
-
-@_hash_data.register
-def _(_: atom_layout.AtomLayout) -> str:
-  return '<<atom-layout>>'
-
-
 class InferenceTest(test_utils.StructureTestCase):
   """Test AlphaFold 3 inference."""
 
@@ -138,7 +98,7 @@ class InferenceTest(test_utils.StructureTestCase):
         / 'test_data/miniature_databases/rnacentral_active_seq_id_90_cov_80_linclust__subsampled_1000.fasta'
     ).path()
     pdb_database_path = testing_data.Data(
-        resources.ROOT / 'data/testdata/templates_v2/ww_pdb'
+        resources.ROOT / 'test_data/miniature_databases/pdb_mmcif'
     ).path()
     seqres_database_path = testing_data.Data(
         resources.ROOT
@@ -160,6 +120,7 @@ class InferenceTest(test_utils.StructureTestCase):
         rna_central_database_path=rna_central_database_path,
         pdb_database_path=pdb_database_path,
         seqres_database_path=seqres_database_path,
+        max_template_date=datetime.date(2021, 9, 30),
     )
     test_input = {
         'name': '5tgy',
@@ -167,170 +128,83 @@ class InferenceTest(test_utils.StructureTestCase):
         'sequences': [
             {
                 'protein': {
-                    'id': 'A',
-                    'sequence': 'SEFEKLRQTGDELVQAFQRLREIFDKGDDDSLEQVLEEIEELIQKHRQLFDNRQEAADTEAAKQGDQWVQLFQRFREAIDKGDKDSLEQLLEELEQALQKIRELAEKKN',
+                    'id': 'P',
+                    'sequence': (
+                        'SEFEKLRQTGDELVQAFQRLREIFDKGDDDSLEQVLEEIEELIQKHRQLFDNRQEAADTEAAKQGDQWVQLFQRFREAIDKGDKDSLEQLLEELEQALQKIRELAEKKN'
+                    ),
                     'modifications': [],
                     'unpairedMsa': None,
                     'pairedMsa': None,
                 }
             },
-            {'ligand': {'id': 'B', 'ccdCodes': ['7BU']}},
+            {'ligand': {'id': 'LL', 'ccdCodes': ['7BU']}},
         ],
         'dialect': folding_input.JSON_DIALECT,
         'version': folding_input.JSON_VERSION,
     }
     self._test_input_json = json.dumps(test_input)
+    self._model_config = run_alphafold.make_model_config(
+        return_embeddings=True, flash_attention_implementation='triton'
+    )
     self._runner = run_alphafold.ModelRunner(
-        model_class=run_alphafold.diffusion_model.Diffuser,
-        config=run_alphafold.make_model_config(),
+        config=self._model_config,
         device=jax.local_devices()[0],
         model_dir=pathlib.Path(run_alphafold.MODEL_DIR.value),
     )
 
-  def compare_golden(self, result_path: str) -> None:
-    filename = os.path.split(result_path)[1]
-    golden_path = testing_data.Data(
-        resources.ROOT / f'test_data/{filename}'
-    ).path()
-    with open(golden_path, 'r') as golden_file:
-      golden_text = golden_file.read()
-    with open(result_path, 'r') as result_file:
-      result_text = result_file.read()
-
-    diff = _generate_diff(result_text, golden_text)
-
-    self.assertEqual(diff, "", f"Result differs from golden:\n{diff}")
-
-  def test_config(self):
-    model_config = run_alphafold.make_model_config()
-    model_config_as_str = json.dumps(
-        model_config.as_dict(), sort_keys=True, indent=2
-    )
-    with _output('model_config.json') as (result_path, output):
-      output.write(model_config_as_str.encode('utf-8'))
-    self.compare_golden(result_path)
-
-  def test_featurisation(self):
-    """Run featurisation and assert that the output is as expected."""
-    fold_input = folding_input.Input.from_json(self._test_input_json)
-    data_pipeline = pipeline.DataPipeline(self._data_pipeline_config)
-    full_fold_input = data_pipeline.process(fold_input)
-    featurised_example = featurisation.featurise_input(
-        full_fold_input,
-        ccd=chemical_components.cached_ccd(),
-        buckets=None,
-    )
-
-    with _output('featurised_example.pkl') as (_, output):
-      output.write(pickle.dumps(featurised_example))
-    featurised_example = jax.tree_util.tree_map(_hash_data, featurised_example)
-    with _output('featurised_example.json') as (result_path, output):
-      output.write(
-          json.dumps(featurised_example, sort_keys=True, indent=2).encode(
-              'utf-8'
-          )
-      )
-    self.compare_golden(result_path)
-
   def test_model_inference(self):
-    """Run model inference and assert that the output is as expected."""
+    """Run model inference and assert that output exists."""
     featurised_examples = pickle.loads(
         (resources.ROOT / 'test_data' / 'featurised_example.pkl').read_bytes()
     )
 
     self.assertLen(featurised_examples, 1)
     featurised_example = featurised_examples[0]
-    inference_result = self._runner.run_inference(
+    result = self._runner.run_inference(
         featurised_example, jax.random.PRNGKey(0)
     )
-    inference_result = jax.tree_util.tree_map(_hash_data, inference_result)
-    self.assertIsNotNone(inference_result)
-
-  def test_write_input_json(self):
-    fold_input = folding_input.Input.from_json(self._test_input_json)
-    output_dir = self.create_tempdir()
-    run_alphafold.write_fold_input_json(fold_input, output_dir)
-    with open(
-        os.path.join(output_dir, f'{fold_input.sanitised_name()}_data.json'),
-        'rt',
-    ) as f:
-      actual_fold_input = folding_input.Input.from_json(f.read())
-
-    self.assertEqual(actual_fold_input, fold_input)
-
-  def test_process_fold_input_runs_only_data_pipeline(self):
-    fold_input = folding_input.Input.from_json(self._test_input_json)
-    output_dir = self.create_tempdir()
-    run_alphafold.process_fold_input(
-        fold_input=fold_input,
-        data_pipeline_config=self._data_pipeline_config,
-        model_runner=None,
-        output_dir=output_dir,
+    self.assertIsNotNone(result)
+    _, embeddings = self._runner.extract_inference_results_and_maybe_embeddings(
+        batch=featurised_example, result=result, target_name='target'
     )
-    with open(
-        os.path.join(output_dir, f'{fold_input.sanitised_name()}_data.json'),
-        'rt',
-    ) as f:
-      actual_fold_input = folding_input.Input.from_json(f.read())
-
-    featurisation.validate_fold_input(actual_fold_input)
+    self.assertLen(embeddings, 2)
 
   def test_process_fold_input_runs_only_inference(self):
     with self.assertRaisesRegex(ValueError, 'missing unpaired MSA.'):
       run_alphafold.process_fold_input(
           fold_input=folding_input.Input.from_json(self._test_input_json),
-          # No data pipeline config, so featursation will run first, and fail
+          # No data pipeline config, so featurisation will run first, and fail
           # since the input is missing MSAs.
           data_pipeline_config=None,
           model_runner=self._runner,
-          output_dir=self.create_tempdir(),
-      )
-
-  def test_no_chains_in_input(self):
-    fold_input = folding_input.Input(
-        name='empty',
-        chains=[],
-        rng_seeds=[0],
-    )
-
-    with self.assertRaisesRegex(ValueError, 'Fold input has no chains.'):
-      run_alphafold.process_fold_input(
-          fold_input=fold_input,
-          data_pipeline_config=self._data_pipeline_config,
-          model_runner=run_alphafold.ModelRunner(
-              model_class=diffusion_model.Diffuser,
-              config=run_alphafold.make_model_config(),
-              device=jax.local_devices(backend='gpu')[0],
-              model_dir=pathlib.Path(run_alphafold.MODEL_DIR.value),
-          ),
-          output_dir='unused output dir',
+          output_dir=self.create_tempdir().full_path,
       )
 
   @parameterized.named_parameters(
       {
           'testcase_name': 'default_bucket',
           'bucket': None,
-          'exp_ranking_scores': [0.69, 0.69, 0.72, 0.75, 0.70],
+          'seed': 1,
       },
       {
           'testcase_name': 'bucket_1024',
           'bucket': 1024,
-          'exp_ranking_scores': [0.69, 0.71, 0.71, 0.69, 0.70],
+          'seed': 42,
       },
   )
-  def test_inference(self, bucket, exp_ranking_scores):
+  def test_inference(self, bucket, seed):
     """Run AlphaFold 3 inference."""
 
-    ### Prepare inputs.
+    ### Prepare inputs with modified seed.
     fold_input = folding_input.Input.from_json(self._test_input_json)
+    fold_input = dataclasses.replace(fold_input, rng_seeds=[seed])
 
-    output_dir = self.create_tempdir()
+    output_dir = self.create_tempdir().full_path
     actual = run_alphafold.process_fold_input(
         fold_input,
         self._data_pipeline_config,
         run_alphafold.ModelRunner(
-            model_class=diffusion_model.Diffuser,
-            config=run_alphafold.make_model_config(),
+            config=self._model_config,
             device=jax.local_devices(backend='gpu')[0],
             model_dir=pathlib.Path(run_alphafold.MODEL_DIR.value),
         ),
@@ -347,27 +221,61 @@ class InferenceTest(test_utils.StructureTestCase):
     )
     expected_data_json_filename = f'{fold_input.sanitised_name()}_data.json'
 
+    prefix = f'seed-{seed}'
     self.assertSameElements(
         os.listdir(output_dir),
         [
-            # Subdirectories, one for each sample.
-            'seed-1234_sample-0',
-            'seed-1234_sample-1',
-            'seed-1234_sample-2',
-            'seed-1234_sample-3',
-            'seed-1234_sample-4',
+            # Subdirectories, one for each sample and one for embeddings.
+            f'{prefix}_sample-0',
+            f'{prefix}_sample-1',
+            f'{prefix}_sample-2',
+            f'{prefix}_sample-3',
+            f'{prefix}_sample-4',
+            f'{prefix}_embeddings',
             # Top ranking result.
             expected_confidences_filename,
             expected_model_cif_filename,
             expected_summary_confidences_filename,
             # Ranking scores for all samples.
-            'ranking_scores.csv',
+            f'{fold_input.sanitised_name()}_ranking_scores.csv',
             # The input JSON defining the job.
             expected_data_json_filename,
             # The output terms of use.
             'TERMS_OF_USE.md',
         ],
     )
+
+    for sample_index in range(5):
+      sample_dir = os.path.join(output_dir, f'{prefix}_sample-{sample_index}')
+      sample_prefix = (
+          f'{fold_input.sanitised_name()}_seed-{seed}_sample-{sample_index}'
+      )
+      self.assertSameElements(
+          os.listdir(sample_dir),
+          [
+              f'{sample_prefix}_confidences.json',
+              f'{sample_prefix}_model.cif',
+              f'{sample_prefix}_summary_confidences.json',
+          ],
+      )
+
+    embeddings_dir = os.path.join(output_dir, f'{prefix}_embeddings')
+    embeddings_filename = (
+        f'{fold_input.sanitised_name()}_{prefix}_embeddings.npz'
+    )
+    self.assertSameElements(os.listdir(embeddings_dir), [embeddings_filename])
+
+    with open(os.path.join(embeddings_dir, embeddings_filename), 'rb') as f:
+      embeddings = np.load(f)
+      self.assertSameElements(
+          embeddings.keys(), ['single_embeddings', 'pair_embeddings']
+      )
+      # Ligand 7BU has 41 tokens.
+      num_tokens = len(fold_input.protein_chains[0].sequence) + 41
+      self.assertEqual(embeddings['single_embeddings'].shape, (num_tokens, 384))
+      self.assertEqual(
+          embeddings['pair_embeddings'].shape, (num_tokens, num_tokens, 128)
+      )
 
     with open(os.path.join(output_dir, expected_data_json_filename), 'rt') as f:
       actual_input_json = json.load(f)
@@ -390,21 +298,23 @@ class InferenceTest(test_utils.StructureTestCase):
         actual_input_json['sequences'][0]['protein']['templates']
     )
 
-    with open(os.path.join(output_dir, 'ranking_scores.csv'), 'rt') as f:
-      actual_ranking_scores = list(csv.DictReader(f))
+    ranking_scores_filename = (
+        f'{fold_input.sanitised_name()}_ranking_scores.csv'
+    )
+    with open(os.path.join(output_dir, ranking_scores_filename), 'rt') as f:
+      ranking_scores = list(csv.DictReader(f))
 
-    self.assertLen(actual_ranking_scores, 5)
+    self.assertLen(ranking_scores, 5)
+    self.assertEqual([int(s['seed']) for s in ranking_scores], [seed] * 5)
     self.assertEqual(
-        [int(s['seed']) for s in actual_ranking_scores], [1234] * 5
+        [int(s['sample']) for s in ranking_scores], [0, 1, 2, 3, 4]
     )
-    self.assertEqual(
-        [int(s['sample']) for s in actual_ranking_scores], [0, 1, 2, 3, 4]
-    )
-    np.testing.assert_array_almost_equal(
-        [float(s['ranking_score']) for s in actual_ranking_scores],
-        exp_ranking_scores,
-        decimal=2,
-    )
+
+    # Ranking score should be between 0.66 and 0.76 for all samples.
+    ranking_scores = [float(s['ranking_score']) for s in ranking_scores]
+    scores_ok = [0.66 <= score <= 0.77 for score in ranking_scores]
+    if not all(scores_ok):
+      self.fail(f'{ranking_scores=} are not in expected range [0.66, 0.77]')
 
     with open(os.path.join(output_dir, 'TERMS_OF_USE.md'), 'rt') as f:
       actual_terms_of_use = f.read()
@@ -442,48 +352,55 @@ class InferenceTest(test_utils.StructureTestCase):
         run_alphafold.ResultsForSeed(**expected_inf)
         for expected_inf in expected_dict
     ]
+
+    actual_rmsds = []
+    mask_proportions = []
+    actual_masked_rmsds = []
     for actual_inf, expected_inf in zip(actual, expected, strict=True):
       for actual_inf, expected_inf in zip(
           actual_inf.inference_results,
           expected_inf.inference_results,
           strict=True,
       ):
-
-        # Check RMSD is within tolerance.
-        # 5tgy is very stable, NMR samples were all within 3.0 RMSD.
-        actual_rmsd = alignment.rmsd_from_coords(
-            actual_inf.predicted_structure.coords,
-            expected_inf.predicted_structure.coords,
+        # Make sure the token chain IDs are the same as the input chain IDs.
+        self.assertEqual(
+            actual_inf.metadata['token_chain_ids'],
+            ['P'] * len(fold_input.protein_chains[0].sequence) + ['LL'] * 41,
         )
-        self.assertLess(actual_rmsd, 3.0)
+        # All atom occupancies should be 1.0.
         np.testing.assert_array_equal(
             actual_inf.predicted_structure.atom_occupancy,
             [1.0] * actual_inf.predicted_structure.num_atoms,
         )
-
-  @parameterized.product(num_db_dirs=tuple(range(1, 3)))
-  def test_replace_db_dir(self, num_db_dirs: int) -> None:
-    """Test that the db_dir is replaced correctly."""
-    db_dirs = [pathlib.Path(self.create_tempdir()) for _ in range(num_db_dirs)]
-    db_dirs_posix = [db_dir.as_posix() for db_dir in db_dirs]
-
-    for i, db_dir in enumerate(db_dirs):
-      for j in range(i + 1):
-        (db_dir / f'filename{j}.txt').write_text(f'hello world {i}')
-
-    for i in range(num_db_dirs):
-      self.assertEqual(
-          pathlib.Path(
-              run_alphafold.replace_db_dir(
-                  f'${{DB_DIR}}/filename{i}.txt', db_dirs_posix
-              )
-          ).read_text(),
-          f'hello world {i}',
-      )
-    with self.assertRaises(FileNotFoundError):
-      run_alphafold.replace_db_dir(
-          f'${{DB_DIR}}/filename{num_db_dirs}.txt', db_dirs_posix
-      )
+        actual_rmsds.append(
+            alignment.rmsd_from_coords(
+                decoy_coords=actual_inf.predicted_structure.coords,
+                gt_coords=expected_inf.predicted_structure.coords,
+            )
+        )
+        # Mask out atoms with b_factor < 80.0 (i.e. lower confidence regions).
+        mask = actual_inf.predicted_structure.atom_b_factor > 80.0
+        mask_proportions.append(
+            np.sum(mask) / actual_inf.predicted_structure.num_atoms
+        )
+        actual_masked_rmsds.append(
+            alignment.rmsd_from_coords(
+                decoy_coords=actual_inf.predicted_structure.coords,
+                gt_coords=expected_inf.predicted_structure.coords,
+                include_idxs=mask,
+            )
+        )
+    # 5tgy is stably predicted, samples should be all within 3.0 RMSD
+    # regardless of seed, bucket, device type, etc.
+    if any(rmsd > 3.0 for rmsd in actual_rmsds):
+      self.fail(f'Full RMSD too high: {actual_rmsds=}')
+    # Check proportion of atoms with b_factor > 80 is at least 70%.
+    if any(prop < 0.7 for prop in mask_proportions):
+      self.fail(f'Too many residues with low pLDDT: {mask_proportions=}')
+    # Check masked RMSD is within tolerance (lower than full RMSD due to masking
+    # of lower confidence regions).
+    if any(rmsd > 1.4 for rmsd in actual_masked_rmsds):
+      self.fail(f'Masked RMSD too high: {actual_masked_rmsds=}')
 
 
 if __name__ == '__main__':

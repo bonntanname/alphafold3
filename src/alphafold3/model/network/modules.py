@@ -19,7 +19,7 @@ from alphafold3.jax.gated_linear_unit import gated_linear_unit
 from alphafold3.model import model_config
 from alphafold3.model.components import haiku_modules as hm
 from alphafold3.model.components import mapping
-from alphafold3.model.diffusion import diffusion_transformer
+from alphafold3.model.network import diffusion_transformer
 import haiku as hk
 import jax
 import jax.numpy as jnp
@@ -149,7 +149,12 @@ class GridSelfAttention(hk.Module):
     self.transpose = transpose
 
   @hk.transparent
-  def _attention(self, act, mask, bias):
+  def _attention(
+      self,
+      act,
+      mask,
+      bias,
+  ):
     num_channels = act.shape[-1]
     assert num_channels % self.config.num_head == 0
     # Triton requires a minimum dimension of 16 for doing matmul.
@@ -230,7 +235,6 @@ class GridSelfAttention(hk.Module):
         chunk_size,
         batched_args=[act, pair_mask],
         nonbatched_args=[nonbatched_bias],
-        input_subbatch_dim_is_partitioned=False,
     )
 
     if self.transpose:
@@ -405,7 +409,6 @@ class OuterProductMean(hk.Module):
         nonbatched_args=[],
         input_subbatch_dim=1,
         output_subbatch_dim=0,
-        input_subbatch_dim_is_partitioned=False,
     )
 
     epsilon = 1e-3
