@@ -32,6 +32,9 @@ dependencies = [
     "setuptools>=75.6.0",
     "biopython>=1.85",
     "pandas>=2.2.3",
+    "scikit-learn>=1.6.1",
+    "torch>=2.5.1",
+    "transformers>=4.51.3",
 ]
 
 [project.optional-dependencies]
