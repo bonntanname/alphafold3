@@ -12,7 +12,7 @@
 set -euo pipefail
 
 #readonly db_dir=${1:-$HOME/public_databases}
-db_dir="/data1/hikari/public_databases"
+db_dir="/work/hisahiro_ikari/public_databases"
 
 for cmd in wget tar zstd ; do
   if ! command -v "${cmd}" > /dev/null 2>&1; then

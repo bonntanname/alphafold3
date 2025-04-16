@@ -12,11 +12,11 @@ import json
 import subprocess
 from Bio import SeqIO
 
-USER_NAME = "hikari"
+USER_NAME = "hisahiro_ikari"
     
 # 環境に合わせた各種パスの設定（必要に応じて変更してください）
 HMMER3_BINDIR = f"/home/{USER_NAME}/hmmer/bin"        # HMMER3 のバイナリディレクトリ
-DB_DIR = f"/data1/{USER_NAME}/public_databases"         # 配列・構造データベースのディレクトリ
+DB_DIR = f"/work/{USER_NAME}/public_databases"         # 配列・構造データベースのディレクトリ
 MODEL_DIR = f"/home/{USER_NAME}/models"                 # モデルパラメータのディレクトリ
 ALPHAFOLD3DIR = f"/home/{USER_NAME}/alphafold3" # AlphaFold3 のコードが格納されたディレクトリ
 def get_first_protein_sequence(fasta_file_path):

@@ -5,9 +5,9 @@
 
 ### 各自の環境に合わせて変更してください #
 #ALPHAFOLD3DIR="/home/hikari/alphafold3"    # AlphaFold3のコードのディレクトリ
-HMMER3_BINDIR="/home/hikari/hmmer/bin" # HMMER3のバイナリディレクトリ
-DB_DIR="/data1/hikari/public_databases"   # 配列・構造データベースのディレクトリ
-MODEL_DIR="/home/hikari/models"         # モデルパラメータのディレクトリ
+HMMER3_BINDIR="/home/hisahiro_ikari/hmmer/bin" # HMMER3のバイナリディレクトリ
+DB_DIR="/work/hisahiro_ikari/public_databases"   # 配列・構造データベースのディレクトリ
+MODEL_DIR="/home/hisahiro_ikari/models"         # モデルパラメータのディレクトリ
 ##########################################
 ### activate alphafold3's virtual environment
 cd ~/alphafold3
