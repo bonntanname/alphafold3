@@ -11,6 +11,9 @@ from transformers import AutoTokenizer, AutoModel
 import json
 import subprocess
 from Bio import SeqIO
+import logging
+import datetime
+import shutil
 
 USER_NAME = "hisahiro_ikari"
     
@@ -19,6 +22,22 @@ HMMER3_BINDIR = f"/home/{USER_NAME}/hmmer/bin"        # HMMER3 のバイナリ�
 DB_DIR = f"/work/{USER_NAME}/public_databases"         # 配列・構造データベースのディレクトリ
 MODEL_DIR = f"/home/{USER_NAME}/models"                 # モデルパラメータのディレクトリ
 ALPHAFOLD3DIR = f"/home/{USER_NAME}/alphafold3" # AlphaFold3 のコードが格納されたディレクトリ
+OUTPUT_DIR = "output"
+def get_checkpoint_dir(base_path, base_name):
+    # 今日の日付を "YYYYMMDD" の形式で取得
+    today_str = datetime.datetime.now().strftime("%Y%m%d")
+    # 基本のディレクトリ名を組み立てる
+    checkpoint_dir = os.path.join(base_path, f"{base_name}{today_str}")
+    
+    # 同名ディレクトリが存在する場合は、連番のサフィックスを追加して新たなディレクトリ名を作成
+    suffix = 1
+    original_dir = checkpoint_dir
+    while os.path.exists(checkpoint_dir):
+        checkpoint_dir = f"{original_dir}_{suffix}"
+        suffix += 1
+    
+    return checkpoint_dir
+
 def get_first_protein_sequence(fasta_file_path):
     """FASTAファイルから最初のタンパク質の配列を取得して返す
 
@@ -38,12 +57,9 @@ def get_first_protein_sequence(fasta_file_path):
         if record is None:
             raise ValueError("FASTAファイルに配列が含まれていません。")
         return str(record.seq)
-def create_json(given_sequence0, given_sequence1, output_name, output_dir):
-    # JSON形式のデータを定義
-    os.makedirs(output_dir, exist_ok = True)
-    output_path = os.path.join(output_dir, f"{output_name}.json")
-    data = [
-        {
+    
+def create_alphafold_dict(given_sequence0, given_sequence1, output_name):
+    return {
             "name": output_name,
             "modelSeeds": ["42"],
             "sequences": [
@@ -61,16 +77,33 @@ def create_json(given_sequence0, given_sequence1, output_name, output_dir):
                 }
             ]
         }
+def create_json(given_sequence0, given_sequence1, output_name, output_dir):
+    # JSON形式のデータを定義
+    os.makedirs(output_dir, exist_ok = True)
+    output_path = os.path.join(output_dir, f"{output_name}.json")
+    data = [
+        create_alphafold_dict(given_sequence0,given_sequence1,output_name)
     ]
     
     # 指定のファイルパスにJSONデータを書き込み
     with open(output_path, "w") as outfile:
         json.dump(data, outfile, indent=4)
+
 def create_json_3J0A(given_sequence, output_name, output_dir):
     file_B = "fasta_files/3J0A_single.fasta"
     seq_raw = get_first_protein_sequence(file_B)
     create_json(given_sequence, seq_raw, output_name, output_dir)
-def run_alphafold(test_name, json_dir):
+
+def create_multiple_json_3J0A(given_sequences, output_name, output_dir):
+    os.makedirs(output_dir, exist_ok = True)
+    file_B = "fasta_files/3J0A_single.fasta"
+    seq_raw = get_first_protein_sequence(file_B)
+    data = [create_alphafold_dict(seq_raw, given_seq, f"{output_name}_{i}") for i, given_seq in enumerate(given_sequences)]
+    output_path = os.path.join(output_dir, f"{output_name}.json")
+    with open(output_path, "w") as outfile:
+        json.dump(data, outfile, indent=4)
+
+def run_alphafold(json_path):
     """
     AlphaFold3 を実行し、生成された各 summary_confidences.json 内の "ptm" 値の平均を返す関数。
     
@@ -82,10 +115,11 @@ def run_alphafold(test_name, json_dir):
         float or None: 5 つの "ptm" 値の平均。値が取得できなかった場合は None を返す。
     """
     # json_path を json_dir と test_name から組み立てる
-    json_path = os.path.join(json_dir, f"{test_name}.json")
     
     # 作業開始前のカレントディレクトリを保存
     original_dir = os.getcwd()
+    base_output_dir = os.path.join(OUTPUT_DIR, "output")
+    print(f"{base_output_dir=}")
     try:
         # AlphaFold3 のディレクトリに移動
         os.chdir(ALPHAFOLD3DIR)
@@ -101,7 +135,8 @@ def run_alphafold(test_name, json_dir):
             "--db_dir", DB_DIR,
             "--model_dir", MODEL_DIR,
             "--json_path", json_path,
-            "--output_dir", "output"
+            "--jackhmmer_n_cpu", "32",
+            "--output_dir", base_output_dir
         ]
         
         # AlphaFold3 の実行
@@ -119,10 +154,8 @@ def run_alphafold(test_name, json_dir):
         print(f"カレントディレクトリを {original_dir} に戻しました。")
     
     # 出力ディレクトリのベースパスを指定（必要に応じて変更してください）
-    base_output_dir = os.path.join(ALPHAFOLD3DIR, "output")
-    
-    ptm_values = []
-    # i = 0,1,2,3,4 の各ディレクトリから summary_confidences.json を読み込み、"ptm" キーの値を取得
+def get_iptm(test_name):
+    base_output_dir = os.path.join(OUTPUT_DIR, "output")
     summary_file = os.path.join(base_output_dir, test_name, f"{test_name}_summary_confidences.json")
     try:
         with open(summary_file, "r") as f:
@@ -136,7 +169,6 @@ def run_alphafold(test_name, json_dir):
     except Exception as e:
         print(f"{summary_file} の読み込み中にエラーが発生しました: {e}")
         return None
-
 
 def get_loss(protein_string):
     """
@@ -153,12 +185,13 @@ def get_loss(protein_string):
     float: 最小化すべき損失値（相互作用確率の反転値: 1 - 確率）
     """
     if not hasattr(get_loss, 'counter'):
-        get_loss.counter = 8
+        get_loss.counter = 0
     get_loss.counter += 1
     test_name = f"mev_{get_loss.counter}"
-    output_dir = f"{ALPHAFOLD3DIR}/input_json"
+    output_dir = f"{OUTPUT_DIR}/input_json"
     create_json_3J0A(protein_string, test_name, output_dir)
-    interaction_prob = run_alphafold(test_name, output_dir)
+    run_alphafold(test_name, output_dir)
+    interaction_prob = get_iptm(test_name)
     # 相互作用確率を取得
     #interaction_prob = run_interaction_prediction_from_string(protein_string)
     # 最小化問題として扱うため確率を反転（確率が高いほど損失が低くなる）
@@ -166,6 +199,17 @@ def get_loss(protein_string):
     
     return loss
 
+def get_losses(protein_strings):
+    if not hasattr(get_losses, 'counter'):
+        get_losses.counter = 0
+    get_losses.counter += 1
+    test_name = f"mevs_{get_losses.counter}"
+    output_dir = f"{OUTPUT_DIR}/input_json"
+    create_multiple_json_3J0A(protein_strings, test_name, output_dir)
+    json_path = os.path.join(output_dir, f"{test_name}.json")
+    run_alphafold(json_path)
+    ret = [1.0 - get_iptm(f"{test_name}_{i}") for i in range(len(protein_strings))]
+    return ret
 
 def load_esm_model():
     model_name = "facebook/esm2_t33_650M_UR50D"  # 使用するESMモデル
@@ -325,6 +369,26 @@ def evaluate_protein(protein, tokenizer, model):
     
     return embedding, fitness
 
+def evaluate_multiple_proteins(proteins, tokenizer, model):
+    """タンパク質の埋め込みと損失を取得（キャッシュ使用）"""
+    queue_proteins = []
+    for i, protein in enumerate(proteins):
+        if not protein in protein_cache:
+            queue_proteins.append(protein)
+    losses = get_losses(queue_proteins)
+    for i in range(len(queue_proteins)):
+        protein = queue_proteins[i]
+        fitness = losses[i]
+        embedding = get_protein_embedding(protein, tokenizer, model)
+        protein_cache[protein] = {
+            'embedding': embedding,
+            'fitness': fitness
+        }
+
+    embeddings = [protein_cache[protein]["embedding"] for protein in proteins]
+    fitnesses = [protein_cache[protein]["fitness"] for protein in proteins]
+    
+    return embeddings, fitnesses
 # トーナメント選択
 def tournament_selection(population, fitnesses, tournament_size=3):
     """トーナメント選択により個体を選択"""
@@ -332,7 +396,7 @@ def tournament_selection(population, fitnesses, tournament_size=3):
     return min(tournament_indices, key=lambda i: fitnesses[i])
 
 # ベイズ最適化ガイド付き遺伝的アルゴリズムによるタンパク質最適化
-def optimize_protein(epitopes, linkers, n_generations=1000, population_size=50, n_elite=5):
+def optimize_protein(epitopes, linkers, n_generations=1000, population_size=10, n_elite=5):
     """
     ベイズ最適化と遺伝的アルゴリズムを組み合わせたタンパク質最適化
     
@@ -352,18 +416,8 @@ def optimize_protein(epitopes, linkers, n_generations=1000, population_size=50, 
     population = create_initial_population(len(epitopes), len(linkers), population_size)
     
     # 初期集団を評価
-    fitnesses = []
-    proteins = []
-    embeddings = []
-    
-    for individual in population:
-        order, linker_choices = individual
-        protein = generate_protein(epitopes, linkers, order, linker_choices)
-        embedding, fitness = evaluate_protein(protein, tokenizer, model)
-        
-        proteins.append(protein)
-        embeddings.append(embedding)
-        fitnesses.append(fitness)
+    proteins = [generate_protein(epitopes, linkers, order, linker_choices) for order, linker_choices in population]
+    embeddings, fitnesses = evaluate_multiple_proteins(proteins, tokenizer, model)
     
     # 最良解の初期化
     best_idx = np.argmin(fitnesses)
@@ -427,18 +481,9 @@ def optimize_protein(epitopes, linkers, n_generations=1000, population_size=50, 
         
         # 新しい集団を評価
         population = next_population
-        proteins = []
-        embeddings = []
-        fitnesses = []
         
-        for individual in population:
-            order, linker_choices = individual
-            protein = generate_protein(epitopes, linkers, order, linker_choices)
-            embedding, fitness = evaluate_protein(protein, tokenizer, model)
-            
-            proteins.append(protein)
-            embeddings.append(embedding)
-            fitnesses.append(fitness)
+        proteins = [generate_protein(epitopes, linkers, order, linker_choices) for order, linker_choices in population]
+        embeddings, fitnesses = evaluate_multiple_proteins(proteins, tokenizer, model)
         
         # 最良個体の更新
         current_best_idx = np.argmin(fitnesses)
@@ -448,14 +493,30 @@ def optimize_protein(epitopes, linkers, n_generations=1000, population_size=50, 
             best_fitness = current_best_fitness
             best_individual = population[current_best_idx]
             best_protein = proteins[current_best_idx]
-            print(f"世代 {generation+1}/{n_generations}, 新しいベスト損失: {best_fitness}, {best_protein=}")
+            logging.info(f"世代 {generation+1}/{n_generations}, 新しいベスト損失: {best_fitness}, {best_protein=}")
         else:
-            print(f"世代 {generation+1}/{n_generations}, ベスト損失: {best_fitness}, {best_protein=}")
+            logging.info(f"世代 {generation+1}/{n_generations}, ベスト損失: {best_fitness}, {best_protein=}")
     
     return best_protein, best_fitness
 
 # 使用例
 def main():
+    global OUTPUT_DIR
+    OUTPUT_DIR = get_checkpoint_dir("checkpoints", "bayes")
+    print(f"{OUTPUT_DIR=}")
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    shutil.copy(__file__, os.path.join(OUTPUT_DIR, os.path.basename(__file__)))
+    
+    # ロギングの設定
+    log_file_path = os.path.join(OUTPUT_DIR, "output.log")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[
+            logging.FileHandler(log_file_path),
+            logging.StreamHandler()
+        ]
+    )
     # エピトープとリンカーの例
     epitopes = [
         'LIKKNDAYPTIKISYNNTNREDL',
