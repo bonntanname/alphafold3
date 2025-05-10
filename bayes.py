@@ -14,6 +14,9 @@ from Bio import SeqIO
 import logging
 import datetime
 import shutil
+import concurrent.futures
+from typing import List
+
 
 USER_NAME = "hisahiro_ikari"
     
@@ -90,41 +93,30 @@ def create_json(given_sequence0, given_sequence1, output_name, output_dir):
         json.dump(data, outfile, indent=4)
 
 def create_json_3J0A(given_sequence, output_name, output_dir):
-    file_B = "fasta_files/3J0A_single.fasta"
+    file_B = "fasta_files/4G8A_single.fasta"
     seq_raw = get_first_protein_sequence(file_B)
     create_json(given_sequence, seq_raw, output_name, output_dir)
 
+
 def create_multiple_json_3J0A(given_sequences, output_name, output_dir):
-    os.makedirs(output_dir, exist_ok = True)
-    file_B = "fasta_files/3J0A_single.fasta"
+    os.makedirs(output_dir, exist_ok=True)
+    file_B = "fasta_files/4G8A_single.fasta"
     seq_raw = get_first_protein_sequence(file_B)
     data = [create_alphafold_dict(seq_raw, given_seq, f"{output_name}_{i}") for i, given_seq in enumerate(given_sequences)]
     output_path = os.path.join(output_dir, f"{output_name}.json")
     with open(output_path, "w") as outfile:
         json.dump(data, outfile, indent=4)
 
-def run_alphafold(json_path):
-    """
-    AlphaFold3 を実行し、生成された各 summary_confidences.json 内の "ptm" 値の平均を返す関数。
-    
-    Parameters:
-        json_dir (str): JSONファイルが存在するディレクトリ
-        test_name (str): テスト名。ファイル名は {test_name}.json として利用され、また出力ディレクトリにも用いられる。
-        
-    Returns:
-        float or None: 5 つの "ptm" 値の平均。値が取得できなかった場合は None を返す。
-    """
-    # json_path を json_dir と test_name から組み立てる
-    
-    # 作業開始前のカレントディレクトリを保存
+def run_alphafold_on_gpu(json_path, gpu_device):
     original_dir = os.getcwd()
     base_output_dir = os.path.join(OUTPUT_DIR, "output")
-    print(f"{base_output_dir=}")
+
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = str(gpu_device)
+
     try:
-        # AlphaFold3 のディレクトリに移動
         os.chdir(ALPHAFOLD3DIR)
-        
-        # uv run で実行するコマンド引数をリスト形式で構築
+
         cmd = [
             "uv", "run", "run_alphafold.py",
             "--jackhmmer_binary_path", os.path.join(HMMER3_BINDIR, "jackhmmer"),
@@ -135,25 +127,20 @@ def run_alphafold(json_path):
             "--db_dir", DB_DIR,
             "--model_dir", MODEL_DIR,
             "--json_path", json_path,
-            "--jackhmmer_n_cpu", "32",
-            "--output_dir", base_output_dir
+            #"--jackhmmer_n_cpu", "8",
+            "--output_dir", base_output_dir,
+            "--gpu_device", "0"  # 常に0にする。CUDA_VISIBLE_DEVICESで切り替えるため
         ]
-        
-        # AlphaFold3 の実行
-        subprocess.run(cmd, check=True)
-        print("AlphaFold3 の実行が正常に完了しました。")
-        
+
+        subprocess.run(cmd, check=True, env=env)
+        print(f"AlphaFold3 (GPU {gpu_device}) execution completed.")
+
     except subprocess.CalledProcessError as e:
-        print("AlphaFold3 の実行中にエラーが発生しました:")
-        print(e)
-        return None
-        
+        print(f"Error running AlphaFold3 on GPU {gpu_device}: {e}")
+
     finally:
-        # 実行前のカレントディレクトリに戻す
         os.chdir(original_dir)
-        print(f"カレントディレクトリを {original_dir} に戻しました。")
-    
-    # 出力ディレクトリのベースパスを指定（必要に応じて変更してください）
+
 def get_iptm(test_name):
     base_output_dir = os.path.join(OUTPUT_DIR, "output")
     summary_file = os.path.join(base_output_dir, test_name, f"{test_name}_summary_confidences.json")
@@ -170,46 +157,42 @@ def get_iptm(test_name):
         print(f"{summary_file} の読み込み中にエラーが発生しました: {e}")
         return None
 
-def get_loss(protein_string):
-    """
-    タンパク質の配列文字列を受け取り、3J0Aとの相互作用を予測し、
-    ベイズ最適化用の損失値を返します。
-    
-    ベイズ最適化では最小化問題として扱うため、
-    相互作用確率が高いほど損失値が低くなるよう変換します。
-    
-    Parameters:
-    protein_string (str): タンパク質の配列文字列
-    
-    Returns:
-    float: 最小化すべき損失値（相互作用確率の反転値: 1 - 確率）
-    """
-    if not hasattr(get_loss, 'counter'):
-        get_loss.counter = 0
-    get_loss.counter += 1
-    test_name = f"mev_{get_loss.counter}"
-    output_dir = f"{OUTPUT_DIR}/input_json"
-    create_json_3J0A(protein_string, test_name, output_dir)
-    run_alphafold(test_name, output_dir)
-    interaction_prob = get_iptm(test_name)
-    # 相互作用確率を取得
-    #interaction_prob = run_interaction_prediction_from_string(protein_string)
-    # 最小化問題として扱うため確率を反転（確率が高いほど損失が低くなる）
-    loss = 1.0 - interaction_prob
-    
-    return loss
-
-def get_losses(protein_strings):
+# loss を並列で取得する関数
+def get_losses(protein_strings: List[str], num_gpus=8):
     if not hasattr(get_losses, 'counter'):
         get_losses.counter = 0
+
     get_losses.counter += 1
     test_name = f"mevs_{get_losses.counter}"
-    output_dir = f"{OUTPUT_DIR}/input_json"
-    create_multiple_json_3J0A(protein_strings, test_name, output_dir)
-    json_path = os.path.join(output_dir, f"{test_name}.json")
-    run_alphafold(json_path)
-    ret = [1.0 - get_iptm(f"{test_name}_{i}") for i in range(len(protein_strings))]
-    return ret
+    output_dir = os.path.join(OUTPUT_DIR, "input_json")
+
+    # 配列をGPUの数で分割する
+    chunk_size = (len(protein_strings) + num_gpus - 1) // num_gpus
+    protein_chunks = [protein_strings[i * chunk_size:(i + 1) * chunk_size] for i in range(num_gpus)]
+
+    # JSONを分割して作成し、並列で実行
+    json_paths = []
+    for idx, chunk in enumerate(protein_chunks):
+        chunk_test_name = f"{test_name}_gpu_{idx}"
+        create_multiple_json_3J0A(chunk, chunk_test_name, output_dir)
+        json_paths.append((os.path.join(output_dir, f"{chunk_test_name}.json"), idx))
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=num_gpus) as executor:
+        futures = [executor.submit(run_alphafold_on_gpu, path, gpu) for path, gpu in json_paths]
+        concurrent.futures.wait(futures)
+
+    # 各々のGPUで生成された結果を統合
+    losses = []
+    for idx, chunk in enumerate(protein_chunks):
+        for i in range(len(chunk)):
+            full_test_name = f"{test_name}_gpu_{idx}_{i}"
+            iptm = get_iptm(full_test_name)
+            loss = 1.0 - iptm if iptm is not None else None
+            losses.append(loss)
+
+    return losses
+
+
 
 def load_esm_model():
     model_name = "facebook/esm2_t33_650M_UR50D"  # 使用するESMモデル
@@ -353,22 +336,6 @@ def expected_improvement(mean, std, best_f, xi=0.01):
 # 評価済みタンパク質のキャッシュ
 protein_cache = {}
 
-# タンパク質を評価（キャッシュを使用して再評価を防止）
-def evaluate_protein(protein, tokenizer, model):
-    """タンパク質の埋め込みと損失を取得（キャッシュ使用）"""
-    if protein in protein_cache:
-        return protein_cache[protein]['embedding'], protein_cache[protein]['fitness']
-    
-    embedding = get_protein_embedding(protein, tokenizer, model)
-    fitness = get_loss(protein)
-    
-    protein_cache[protein] = {
-        'embedding': embedding,
-        'fitness': fitness
-    }
-    
-    return embedding, fitness
-
 def evaluate_multiple_proteins(proteins, tokenizer, model):
     """タンパク質の埋め込みと損失を取得（キャッシュ使用）"""
     queue_proteins = []
@@ -396,7 +363,7 @@ def tournament_selection(population, fitnesses, tournament_size=3):
     return min(tournament_indices, key=lambda i: fitnesses[i])
 
 # ベイズ最適化ガイド付き遺伝的アルゴリズムによるタンパク質最適化
-def optimize_protein(epitopes, linkers, n_generations=1000, population_size=10, n_elite=5):
+def optimize_protein(epitopes, linkers, n_generations=1000, population_size=60, n_elite=5):
     """
     ベイズ最適化と遺伝的アルゴリズムを組み合わせたタンパク質最適化
     
@@ -502,7 +469,7 @@ def optimize_protein(epitopes, linkers, n_generations=1000, population_size=10, 
 # 使用例
 def main():
     global OUTPUT_DIR
-    OUTPUT_DIR = get_checkpoint_dir("checkpoints", "bayes")
+    OUTPUT_DIR = get_checkpoint_dir("checkpoints", "bayes_Toll4")
     print(f"{OUTPUT_DIR=}")
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     shutil.copy(__file__, os.path.join(OUTPUT_DIR, os.path.basename(__file__)))
